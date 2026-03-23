@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SA Household Wealth Calculator</title>
+  <meta name="description" content="South African household wealth, tax, and financial planning calculator. SARS 2027 tax year." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { height: 100%; }
+    body { font-family: 'Outfit', 'Segoe UI', sans-serif; }
+    .font-mono { font-family: 'Fira Code', monospace; }
+    /* Hide number input spinners */
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+    select option { background: #111827; color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useReducer, useMemo, useCallback, useEffect, useRef } = React;
+    const { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine, Cell } = Recharts;
+
+
+// ─── SARS 2027 Tax Year Constants ───
+const TAX_BRACKETS = [
+  { min: 0, max: 245100, rate: 0.18, base: 0 },
+  { min: 245101, max: 383100, rate: 0.26, base: 44118 },
+  { min: 383101, max: 530200, rate: 0.31, base: 79998 },
+  { min: 530201, max: 695800, rate: 0.36, base: 125599 },
+  { min: 695801, max: 887000, rate: 0.39, base: 185215 },
+  { min: 887001, max: 1878600, rate: 0.41, base: 259783 },
+  { min: 1878601, max: Infinity, rate: 0.45, base: 666339 },
+];
+const REBATE_PRIMARY = 17820;
+const REBATE_SECONDARY = 9765;
+const REBATE_TERTIARY = 3249;
+const TFSA_ANNUAL = 46000;
+const TFSA_LIFETIME = 500000;
+const RA_RATE = 0.275;
+const RA_CAP = 430000;
+const INTEREST_EXEMPTION_U65 = 23800;
+const INTEREST_EXEMPTION_65 = 34500;
+const CGT_EXCLUSION = 40000;
+const CGT_INCLUSION = 0.4;
+const DIV_WHT = 0.2;
+const DONATION_EXEMPT = 100000;
+const DONATION_TAX_RATE = 0.2;
+const MED_CREDIT_MAIN = 364;
+const MED_CREDIT_FIRST_DEP = 364;
+const MED_CREDIT_ADDL_DEP = 246;
+const UIF_RATE = 0.01;
+const UIF_MONTHLY_CAP = 177.12;
+const UIF_ANNUAL_CAP = 2125.44;
+
+// ─── Helpers ───
+const fmt = (n) => {
+  if (n == null || isNaN(n)) return "R0";
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return `R${(n / 1e6).toFixed(2)}m`;
+  if (abs >= 1e3) return `R${(n / 1e3).toFixed(0)}k`;
+  return `R${Math.round(n).toLocaleString("en-ZA")}`;
+};
+const fmtFull = (n) => `R${Math.round(n || 0).toLocaleString("en-ZA")}`;
+const pct = (n) => `${(n * 100).toFixed(1)}%`;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function calcTax(taxableIncome, age) {
+  if (taxableIncome <= 0) return 0;
+  let bracket = TAX_BRACKETS.find((b) => taxableIncome <= b.max) || TAX_BRACKETS[TAX_BRACKETS.length - 1];
+  let tax = bracket.base + (taxableIncome - (bracket.min > 0 ? bracket.min - 1 : 0)) * bracket.rate;
+  // Fix: recalculate correctly using bracket lower bound
+  tax = bracket.base + (taxableIncome - bracket.min + (bracket.min > 0 ? 1 : 0)) * bracket.rate;
+  // Actually let's do it properly
+  tax = 0;
+  for (const b of TAX_BRACKETS) {
+    if (taxableIncome <= 0) break;
+    const lo = b.min === 0 ? 0 : b.min;
+    const hi = b.max;
+    const width = hi - lo + (lo === 0 ? 1 : 1);
+    const inBracket = Math.min(taxableIncome - lo, hi - lo + (lo === 0 ? 1 : 1));
+    if (taxableIncome > hi) {
+      // Full bracket
+    } else {
+      // Partial
+      tax = b.base + (taxableIncome - lo) * b.rate;
+      break;
+    }
+  }
+  // Simplest correct approach:
+  tax = 0;
+  let remaining = taxableIncome;
+  let prevMax = 0;
+  for (const b of TAX_BRACKETS) {
+    const bracketLow = prevMax;
+    const bracketHigh = b.max;
+    const taxableInBracket = Math.min(remaining, bracketHigh - bracketLow);
+    if (taxableInBracket <= 0) break;
+    tax += taxableInBracket * b.rate;
+    remaining -= taxableInBracket;
+    prevMax = bracketHigh;
+    if (remaining <= 0) break;
+  }
+
+  let rebate = REBATE_PRIMARY;
+  if (age >= 65) rebate += REBATE_SECONDARY;
+  if (age >= 75) rebate += REBATE_TERTIARY;
+  return Math.max(0, tax - rebate);
+}
+
+function getMarginalRate(taxableIncome) {
+  if (taxableIncome <= 0) return 0;
+  const bracket = TAX_BRACKETS.find((b) => taxableIncome <= b.max) || TAX_BRACKETS[TAX_BRACKETS.length - 1];
+  return bracket.rate;
+}
+
+function calcMedCredits(mainMember, numDependants) {
+  if (!mainMember) return 0;
+  let credits = MED_CREDIT_MAIN; // main member
+  if (numDependants >= 1) credits += MED_CREDIT_FIRST_DEP; // first dependant
+  if (numDependants > 1) credits += (numDependants - 1) * MED_CREDIT_ADDL_DEP;
+  return credits * 12;
+}
+
+function calcUIF(grossAnnual) {
+  const monthly = Math.min(grossAnnual / 12 * UIF_RATE, UIF_MONTHLY_CAP);
+  return monthly * 12;
+}
+
+function calcBondPayment(principal, annualRate, months) {
+  if (principal <= 0 || months <= 0) return 0;
+  const r = annualRate / 12;
+  if (r === 0) return principal / months;
+  return principal * (r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1);
+}
+
+function amortiseBondYear(balance, annualRate, monthlyPayment) {
+  let bal = balance;
+  const r = annualRate / 12;
+  for (let m = 0; m < 12; m++) {
+    if (bal <= 0) break;
+    const interest = bal * r;
+    const principal = Math.min(monthlyPayment - interest, bal);
+    bal -= principal;
+  }
+  return Math.max(0, bal);
+}
+
+// ─── Initial State ───
+const defaultPerson = (name) => ({
+  name,
+  grossIncome: 0,
+  age: 30,
+  raContribSelf: 0,
+  raContribEmployer: 0,
+  raDeductedFromPayroll: true,
+  pensionBalance: 0,
+  tfsaBalance: 0,
+  tfsaLifetimeContributed: 0,
+  tfsaAnnualContrib: 0,
+  hasMedicalAid: false,
+  medDependants: 0,
+  discretionaryInvestments: 0,
+  cashSavings: 0,
+});
+
+const defaultChild = (i) => ({
+  name: `Child ${i + 1}`,
+  age: 5,
+  monthlyCosts: 0,
+  schoolFeesAnnual: 0,
+  endEducationAge: 18,
+  tfsaBalance: 0,
+  tfsaLifetimeContributed: 0,
+  tfsaAnnualContrib: 0,
+  discretionaryBalance: 0,
+  donationFromP1: 0,
+  donationFromP2: 0,
+});
+
+const defaultBond = (i) => ({
+  name: `Bond ${i + 1}`,
+  balance: 0,
+  rate: 8.75,
+  termMonths: 240,
+  monthlyPayment: 0,
+  propertyValue: 0,
+});
+
+const initialState = {
+  step: 0,
+  hasSpouse: false,
+  maritalRegime: "oocop_a",
+  persons: [defaultPerson("You")],
+  children: [],
+  bonds: [{ ...defaultBond(0), name: "Home loan" }],
+  otherDebts: [],
+  otherAssets: [],
+  monthlyExpenses: 0,
+  emergencyFundTarget: 3,
+  lumpSum: 0,
+  projectionYears: 20,
+  returns: {
+    tfsa: 11,
+    ra: 10,
+    equity: 12,
+    property: 6,
+    moneyMarket: 8.5,
+    inflation: 5.5,
+    educationInflation: 8,
+  },
+};
+
+function reducer(state, action) {
+  const { type, payload } = action;
+  switch (type) {
+    case "SET":
+      return { ...state, ...payload };
+    case "SET_PERSON": {
+      const persons = [...state.persons];
+      persons[payload.idx] = { ...persons[payload.idx], ...payload.data };
+      return { ...state, persons };
+    }
+    case "TOGGLE_SPOUSE": {
+      const hasSpouse = !state.hasSpouse;
+      const persons = hasSpouse
+        ? [state.persons[0], defaultPerson("Spouse")]
+        : [state.persons[0]];
+      return { ...state, hasSpouse, persons };
+    }
+    case "ADD_CHILD": {
+      if (state.children.length >= 4) return state;
+      return { ...state, children: [...state.children, defaultChild(state.children.length)] };
+    }
+    case "REMOVE_CHILD": {
+      return { ...state, children: state.children.filter((_, i) => i !== payload) };
+    }
+    case "SET_CHILD": {
+      const children = [...state.children];
+      children[payload.idx] = { ...children[payload.idx], ...payload.data };
+      return { ...state, children };
+    }
+    case "SET_BOND": {
+      const bonds = [...state.bonds];
+      bonds[payload.idx] = { ...bonds[payload.idx], ...payload.data };
+      return { ...state, bonds };
+    }
+    case "ADD_BOND": {
+      if (state.bonds.length >= 3) return state;
+      return { ...state, bonds: [...state.bonds, defaultBond(state.bonds.length)] };
+    }
+    case "REMOVE_BOND":
+      return { ...state, bonds: state.bonds.filter((_, i) => i !== payload) };
+    case "ADD_DEBT":
+      return { ...state, otherDebts: [...state.otherDebts, { name: "", balance: 0, rate: 0, monthlyPayment: 0 }] };
+    case "SET_DEBT": {
+      const otherDebts = [...state.otherDebts];
+      otherDebts[payload.idx] = { ...otherDebts[payload.idx], ...payload.data };
+      return { ...state, otherDebts };
+    }
+    case "REMOVE_DEBT":
+      return { ...state, otherDebts: state.otherDebts.filter((_, i) => i !== payload) };
+    case "ADD_ASSET":
+      return { ...state, otherAssets: [...state.otherAssets, { name: "", value: 0 }] };
+    case "SET_ASSET": {
+      const otherAssets = [...state.otherAssets];
+      otherAssets[payload.idx] = { ...otherAssets[payload.idx], ...payload.data };
+      return { ...state, otherAssets };
+    }
+    case "REMOVE_ASSET":
+      return { ...state, otherAssets: state.otherAssets.filter((_, i) => i !== payload) };
+    case "SET_RETURNS":
+      return { ...state, returns: { ...state.returns, ...payload } };
+    default:
+      return state;
+  }
+}
+
+// ─── Styles (CSS-in-JS via Tailwind + inline) ───
+const COLORS = {
+  bg: "#0a0e17",
+  card: "#111827",
+  cardHover: "#1a2332",
+  border: "#1e293b",
+  borderFocus: "#38bdf8",
+  text: "#e2e8f0",
+  textMuted: "#94a3b8",
+  textDim: "#64748b",
+  accent: "#38bdf8",
+  accentDim: "#0ea5e9",
+  green: "#34d399",
+  greenDim: "#10b981",
+  red: "#f87171",
+  redDim: "#ef4444",
+  amber: "#fbbf24",
+  purple: "#a78bfa",
+  teal: "#2dd4bf",
+  pink: "#f472b6",
+  orange: "#fb923c",
+  chartColors: ["#38bdf8", "#34d399", "#a78bfa", "#fbbf24", "#f472b6", "#2dd4bf", "#fb923c"],
+};
+
+const STEPS = [
+  { id: "household", label: "Household", icon: "👥" },
+  { id: "income", label: "Income & tax", icon: "💰" },
+  { id: "retirement", label: "Retirement", icon: "🏦" },
+  { id: "tfsa", label: "TFSA", icon: "📈" },
+  { id: "property", label: "Property & debt", icon: "🏠" },
+  { id: "children", label: "Children", icon: "👶" },
+  { id: "budget", label: "Budget", icon: "📊" },
+  { id: "netposition", label: "Net position", icon: "⚖️" },
+  { id: "projection", label: "Projection", icon: "🔮" },
+];
+
+// ─── Reusable Components ───
+function Input({ label, value, onChange, prefix = "R", suffix, type = "number", min, max, step, help, small, className = "" }) {
+  return (
+    <div className={`${small ? "mb-2" : "mb-4"} ${className}`}>
+      {label && <label className="block text-xs font-medium mb-1" style={{ color: COLORS.textMuted }}>{label}</label>}
+      <div className="relative flex items-center">
+        {prefix && <span className="absolute left-3 text-xs" style={{ color: COLORS.textDim }}>{prefix}</span>}
+        <input
+          type={type}
+          value={value || ""}
+          onChange={(e) => onChange(type === "number" ? parseFloat(e.target.value) || 0 : e.target.value)}
+          min={min}
+          max={max}
+          step={step || 1}
+          className="w-full rounded-lg px-3 py-2 text-sm font-mono outline-none transition-all"
+          style={{
+            background: COLORS.bg,
+            border: `1px solid ${COLORS.border}`,
+            color: COLORS.text,
+            paddingLeft: prefix ? "2rem" : "0.75rem",
+            paddingRight: suffix ? "3rem" : "0.75rem",
+          }}
+          onFocus={(e) => (e.target.style.borderColor = COLORS.borderFocus)}
+          onBlur={(e) => (e.target.style.borderColor = COLORS.border)}
+        />
+        {suffix && <span className="absolute right-3 text-xs" style={{ color: COLORS.textDim }}>{suffix}</span>}
+      </div>
+      {help && <p className="mt-1 text-xs" style={{ color: COLORS.textDim }}>{help}</p>}
+    </div>
+  );
+}
+
+function Toggle({ label, checked, onChange, help }) {
+  return (
+    <div className="mb-4">
+      <label className="flex items-center gap-3 cursor-pointer">
+        <div
+          className="relative w-10 h-5 rounded-full transition-colors"
+          style={{ background: checked ? COLORS.accent : COLORS.border }}
+          onClick={onChange}
+        >
+          <div
+            className="absolute top-0.5 w-4 h-4 rounded-full transition-transform"
+            style={{
+              background: checked ? "#fff" : COLORS.textDim,
+              left: checked ? "22px" : "2px",
+            }}
+          />
+        </div>
+        <span className="text-sm" style={{ color: COLORS.text }}>{label}</span>
+      </label>
+      {help && <p className="mt-1 text-xs ml-13" style={{ color: COLORS.textDim }}>{help}</p>}
+    </div>
+  );
+}
+
+function Select({ label, value, onChange, options, help }) {
+  return (
+    <div className="mb-4">
+      {label && <label className="block text-xs font-medium mb-1" style={{ color: COLORS.textMuted }}>{label}</label>}
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+        style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}`, color: COLORS.text }}
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>{o.label}</option>
+        ))}
+      </select>
+      {help && <p className="mt-1 text-xs" style={{ color: COLORS.textDim }}>{help}</p>}
+    </div>
+  );
+}
+
+function Card({ children, title, subtitle, className = "", accent }) {
+  return (
+    <div
+      className={`rounded-xl p-4 mb-4 ${className}`}
+      style={{
+        background: COLORS.card,
+        border: `1px solid ${accent || COLORS.border}`,
+      }}
+    >
+      {title && (
+        <div className="mb-3">
+          <h3 className="text-sm font-semibold" style={{ color: accent || COLORS.text }}>{title}</h3>
+          {subtitle && <p className="text-xs mt-0.5" style={{ color: COLORS.textDim }}>{subtitle}</p>}
+        </div>
+      )}
+      {children}
+    </div>
+  );
+}
+
+function Metric({ label, value, sub, color, small }) {
+  return (
+    <div className={small ? "mb-1" : "mb-3"}>
+      <div className="text-xs" style={{ color: COLORS.textDim }}>{label}</div>
+      <div className={`font-mono ${small ? "text-sm" : "text-lg"} font-bold`} style={{ color: color || COLORS.text }}>
+        {value}
+      </div>
+      {sub && <div className="text-xs" style={{ color: COLORS.textDim }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Tip({ children, type = "info" }) {
+  const colors = { info: COLORS.accent, warn: COLORS.amber, good: COLORS.green };
+  const icons = { info: "💡", warn: "⚠️", good: "✅" };
+  return (
+    <div className="rounded-lg p-3 my-3 text-xs" style={{ background: `${colors[type]}15`, borderLeft: `3px solid ${colors[type]}`, color: COLORS.textMuted }}>
+      <span className="mr-1">{icons[type]}</span> {children}
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return <h2 className="text-lg font-bold mb-4" style={{ color: COLORS.text }}>{children}</h2>;
+}
+
+// ─── Step Components ───
+
+function StepHousehold({ state, dispatch }) {
+  return (
+    <div>
+      <SectionTitle>Household setup</SectionTitle>
+      <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>South Africa taxes individuals separately – your income tax is always calculated individually regardless of marital status. However, understanding the household picture helps with planning.</p>
+
+      <Input
+        label="Your name"
+        value={state.persons[0].name}
+        onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx: 0, data: { name: v } } })}
+        prefix=""
+        type="text"
+      />
+
+      <Toggle
+        label="Include a spouse or partner"
+        checked={state.hasSpouse}
+        onChange={() => dispatch({ type: "TOGGLE_SPOUSE" })}
+      />
+
+      {state.hasSpouse && (
+        <>
+          <Input
+            label="Spouse name"
+            value={state.persons[1]?.name || ""}
+            onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx: 1, data: { name: v } } })}
+            prefix=""
+            type="text"
+          />
+          <Select
+            label="Marital property regime"
+            value={state.maritalRegime}
+            onChange={(v) => dispatch({ type: "SET", payload: { maritalRegime: v } })}
+            options={[
+              { value: "icop", label: "In Community of Property" },
+              { value: "oocop_a", label: "Out of Community – with accrual" },
+              { value: "oocop", label: "Out of Community – without accrual" },
+            ]}
+            help="This affects estate planning, not income tax. SA taxes individuals separately."
+          />
+          {state.maritalRegime === "icop" && (
+            <Tip type="info">In Community of Property: all assets and liabilities are shared 50/50. On death, the surviving spouse owns half the joint estate before any estate duty calculation.</Tip>
+          )}
+          {state.maritalRegime === "oocop_a" && (
+            <Tip type="info">With accrual: each spouse keeps their own estate, but growth during the marriage is shared on dissolution (death or divorce). The spouse with less growth claims half the difference.</Tip>
+          )}
+        </>
+      )}
+
+      <div className="mt-6">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold" style={{ color: COLORS.text }}>Children</h3>
+          {state.children.length < 4 && (
+            <button
+              onClick={() => dispatch({ type: "ADD_CHILD" })}
+              className="text-xs px-3 py-1 rounded-lg"
+              style={{ background: COLORS.accent + "20", color: COLORS.accent }}
+            >
+              + Add child
+            </button>
+          )}
+        </div>
+        {state.children.length === 0 && (
+          <p className="text-xs" style={{ color: COLORS.textDim }}>No children added. Children's TFSAs, education costs, and donations can be tracked here.</p>
+        )}
+        {state.children.map((child, i) => (
+          <Card key={i} title={child.name} accent={COLORS.purple}>
+            <div className="grid grid-cols-2 gap-2">
+              <Input label="Name" value={child.name} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { name: v } } })} prefix="" type="text" small />
+              <Input label="Age" value={child.age} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { age: v } } })} prefix="" suffix="yrs" small />
+            </div>
+            <button
+              onClick={() => dispatch({ type: "REMOVE_CHILD", payload: i })}
+              className="text-xs mt-1 px-2 py-1 rounded"
+              style={{ color: COLORS.red }}
+            >
+              Remove
+            </button>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StepIncomeTax({ state, dispatch }) {
+  const personCalcs = state.persons.map((p) => {
+    const totalRA = (p.raContribSelf || 0) + (p.raContribEmployer || 0);
+    const raDeductible = Math.min(totalRA, Math.min(p.grossIncome * RA_RATE, RA_CAP));
+    const taxableIncome = Math.max(0, p.grossIncome - raDeductible);
+    const grossTax = calcTax(taxableIncome, p.age);
+    const medCredits = calcMedCredits(p.hasMedicalAid, p.medDependants);
+    const tax = Math.max(0, grossTax - medCredits);
+    const uif = calcUIF(p.grossIncome);
+    const netIncome = p.grossIncome - tax - uif - (p.raDeductedFromPayroll ? totalRA : 0);
+    const effectiveRate = p.grossIncome > 0 ? tax / p.grossIncome : 0;
+    const marginalRate = getMarginalRate(taxableIncome);
+    return { totalRA, raDeductible, taxableIncome, grossTax, medCredits, tax, uif, netIncome, effectiveRate, marginalRate };
+  });
+
+  return (
+    <div>
+      <SectionTitle>Income & tax</SectionTitle>
+      {state.persons.map((person, idx) => {
+        const c = personCalcs[idx];
+        return (
+          <Card key={idx} title={person.name} accent={idx === 0 ? COLORS.accent : COLORS.teal}>
+            <div className="grid grid-cols-2 gap-3">
+              <Input label="Gross annual income" value={person.grossIncome} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { grossIncome: v } } })} />
+              <Input label="Age" value={person.age} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { age: v } } })} prefix="" suffix="yrs" />
+            </div>
+
+            <Toggle
+              label="On medical aid?"
+              checked={person.hasMedicalAid}
+              onChange={() => dispatch({ type: "SET_PERSON", payload: { idx, data: { hasMedicalAid: !person.hasMedicalAid } } })}
+            />
+            {person.hasMedicalAid && (
+              <Input
+                label="Number of dependants on your medical aid"
+                value={person.medDependants}
+                onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { medDependants: v } } })}
+                prefix=""
+                help="Includes spouse and children on this policy. Main member is counted automatically."
+              />
+            )}
+
+            {person.grossIncome > 0 && (
+              <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1">
+                <Metric label="Taxable income" value={fmtFull(c.taxableIncome)} small />
+                <Metric label="Income tax" value={fmtFull(c.tax)} color={COLORS.red} small />
+                <Metric label="UIF" value={fmtFull(c.uif)} color={COLORS.red} small />
+                {person.hasMedicalAid && <Metric label="Medical tax credits" value={fmtFull(c.medCredits)} color={COLORS.green} small />}
+                <Metric label="Effective tax rate" value={pct(c.effectiveRate)} color={COLORS.amber} small />
+                <Metric label="Marginal rate" value={pct(c.marginalRate)} color={COLORS.amber} small />
+                <Metric label="Net annual income" value={fmtFull(c.netIncome)} color={COLORS.green} small />
+                <Metric label="Net monthly income" value={fmtFull(c.netIncome / 12)} color={COLORS.green} small />
+              </div>
+            )}
+          </Card>
+        );
+      })}
+
+      {state.hasSpouse && state.persons[0].grossIncome > 0 && state.persons[1]?.grossIncome > 0 && (
+        <Card title="Household income summary" accent={COLORS.purple}>
+          <div className="grid grid-cols-3 gap-4">
+            <Metric label="Combined gross" value={fmtFull(state.persons.reduce((s, p) => s + p.grossIncome, 0))} />
+            <Metric label="Combined tax" value={fmtFull(personCalcs.reduce((s, c) => s + c.tax + c.uif, 0))} color={COLORS.red} />
+            <Metric label="Combined net" value={fmtFull(personCalcs.reduce((s, c) => s + c.netIncome, 0))} color={COLORS.green} />
+          </div>
+          {Math.abs(state.persons[0].grossIncome - state.persons[1].grossIncome) / Math.max(state.persons[0].grossIncome, state.persons[1].grossIncome) > 0.5 && (
+            <Tip type="info">
+              There's a significant income difference between you and your spouse. Consider holding interest-bearing investments in the lower earner's name – their lower marginal rate means less tax on interest above the R{(INTEREST_EXEMPTION_U65).toLocaleString()} exemption. No donations tax applies between spouses.
+            </Tip>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function StepRetirement({ state, dispatch }) {
+  return (
+    <div>
+      <SectionTitle>Retirement contributions</SectionTitle>
+      <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>
+        You can deduct up to 27.5% of your income (capped at R430k/yr) for RA/pension/provident contributions. This reduces your taxable income.
+      </p>
+      {state.persons.map((person, idx) => {
+        const totalRA = (person.raContribSelf || 0) + (person.raContribEmployer || 0);
+        const maxDeductible = Math.min(person.grossIncome * RA_RATE, RA_CAP);
+        const actualDeductible = Math.min(totalRA, maxDeductible);
+        const overContrib = totalRA > maxDeductible ? totalRA - maxDeductible : 0;
+        return (
+          <Card key={idx} title={person.name} accent={idx === 0 ? COLORS.accent : COLORS.teal}>
+            <Input label="Your own RA/pension contribution (annual)" value={person.raContribSelf} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { raContribSelf: v } } })} />
+            <Input label="Employer contribution (annual)" value={person.raContribEmployer} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { raContribEmployer: v } } })} help="Include employer pension/provident fund contributions" />
+            <Toggle
+              label="Contributions deducted from salary before you receive it?"
+              checked={person.raDeductedFromPayroll}
+              onChange={() => dispatch({ type: "SET_PERSON", payload: { idx, data: { raDeductedFromPayroll: !person.raDeductedFromPayroll } } })}
+              help="If yes, we won't subtract these again from your take-home pay"
+            />
+            <Input label="Total retirement fund balance" value={person.pensionBalance} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { pensionBalance: v } } })} help="Combined value of all RA, pension, provident funds" />
+
+            {person.grossIncome > 0 && (
+              <div className="mt-2">
+                <Metric label="Total annual contribution" value={fmtFull(totalRA)} small />
+                <Metric label="Tax-deductible amount" value={fmtFull(actualDeductible)} color={COLORS.green} small />
+                <Metric label="Max deductible (27.5% cap)" value={fmtFull(maxDeductible)} small />
+                {overContrib > 0 && <Tip type="warn">You're contributing {fmtFull(overContrib)} above the deductible limit. This excess won't reduce your tax this year.</Tip>}
+                {totalRA < maxDeductible * 0.5 && person.grossIncome > 300000 && (
+                  <Tip type="info">You have room to increase contributions by {fmtFull(maxDeductible - totalRA)} and get an additional tax saving of {fmtFull((maxDeductible - totalRA) * getMarginalRate(person.grossIncome - actualDeductible))} at your marginal rate of {pct(getMarginalRate(person.grossIncome - actualDeductible))}.</Tip>
+                )}
+              </div>
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function StepTFSA({ state, dispatch }) {
+  return (
+    <div>
+      <SectionTitle>Tax-free savings accounts</SectionTitle>
+      <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>
+        Each person (including children) can contribute up to R{TFSA_ANNUAL.toLocaleString()}/yr with a R{TFSA_LIFETIME.toLocaleString()} lifetime limit. All growth, dividends, and interest are completely tax-free. Exceeding the annual limit incurs a 40% penalty on the excess.
+      </p>
+
+      {state.persons.map((person, idx) => {
+        const lifetimeRemaining = Math.max(0, TFSA_LIFETIME - person.tfsaLifetimeContributed);
+        const annualMax = Math.min(TFSA_ANNUAL, lifetimeRemaining);
+        return (
+          <Card key={idx} title={person.name} accent={idx === 0 ? COLORS.accent : COLORS.teal}>
+            <Input label="Current TFSA market value" value={person.tfsaBalance} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { tfsaBalance: v } } })} help="What the account is worth today" />
+            <Input label="Total lifetime contributions made" value={person.tfsaLifetimeContributed} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { tfsaLifetimeContributed: v } } })} help={`Lifetime cap: R${TFSA_LIFETIME.toLocaleString()}. You have R${lifetimeRemaining.toLocaleString()} remaining.`} />
+            <Input label="Annual contribution this year" value={person.tfsaAnnualContrib} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { tfsaAnnualContrib: v } } })} help={`Max R${annualMax.toLocaleString()} this year`} />
+            {person.tfsaAnnualContrib > annualMax && (
+              <Tip type="warn">This exceeds your available annual limit. SARS will charge a 40% penalty on the excess R{(person.tfsaAnnualContrib - annualMax).toLocaleString()}.</Tip>
+            )}
+          </Card>
+        );
+      })}
+
+      {state.children.length > 0 && (
+        <>
+          <h3 className="text-sm font-semibold mb-3 mt-6" style={{ color: COLORS.purple }}>Children's TFSAs</h3>
+          {state.children.map((child, i) => {
+            const lifetimeRemaining = Math.max(0, TFSA_LIFETIME - child.tfsaLifetimeContributed);
+            return (
+              <Card key={i} title={child.name} accent={COLORS.purple}>
+                <Input label="TFSA market value" value={child.tfsaBalance} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { tfsaBalance: v } } })} small />
+                <Input label="Lifetime contributions" value={child.tfsaLifetimeContributed} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { tfsaLifetimeContributed: v } } })} help={`R${lifetimeRemaining.toLocaleString()} lifetime remaining`} small />
+                <Input label="Annual contribution" value={child.tfsaAnnualContrib} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { tfsaAnnualContrib: v } } })} small />
+              </Card>
+            );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
+function StepProperty({ state, dispatch }) {
+  return (
+    <div>
+      <SectionTitle>Property & debt</SectionTitle>
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold" style={{ color: COLORS.text }}>Bonds / mortgages</h3>
+        {state.bonds.length < 3 && (
+          <button onClick={() => dispatch({ type: "ADD_BOND" })} className="text-xs px-3 py-1 rounded-lg" style={{ background: COLORS.accent + "20", color: COLORS.accent }}>
+            + Add bond
+          </button>
+        )}
+      </div>
+      {state.bonds.map((bond, i) => {
+        const monthly = bond.balance > 0 ? calcBondPayment(bond.balance, bond.rate / 100, bond.termMonths) : 0;
+        const totalCost = monthly * bond.termMonths;
+        const totalInterest = totalCost - bond.balance;
+        return (
+          <Card key={i} title={bond.name || `Bond ${i + 1}`} accent={COLORS.orange}>
+            <Input label="Name" value={bond.name} onChange={(v) => dispatch({ type: "SET_BOND", payload: { idx: i, data: { name: v } } })} prefix="" type="text" small />
+            <div className="grid grid-cols-2 gap-2">
+              <Input label="Outstanding balance" value={bond.balance} onChange={(v) => dispatch({ type: "SET_BOND", payload: { idx: i, data: { balance: v } } })} small />
+              <Input label="Property market value" value={bond.propertyValue} onChange={(v) => dispatch({ type: "SET_BOND", payload: { idx: i, data: { propertyValue: v } } })} small />
+              <Input label="Interest rate" value={bond.rate} onChange={(v) => dispatch({ type: "SET_BOND", payload: { idx: i, data: { rate: v } } })} prefix="" suffix="%" step={0.25} small />
+              <Input label="Remaining term" value={bond.termMonths} onChange={(v) => dispatch({ type: "SET_BOND", payload: { idx: i, data: { termMonths: v } } })} prefix="" suffix="months" small />
+            </div>
+            {bond.balance > 0 && (
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <Metric label="Monthly repayment" value={fmtFull(monthly)} small />
+                <Metric label="Total interest" value={fmtFull(totalInterest)} color={COLORS.red} small />
+                {bond.propertyValue > 0 && <Metric label="Equity in property" value={fmtFull(bond.propertyValue - bond.balance)} color={bond.propertyValue > bond.balance ? COLORS.green : COLORS.red} small />}
+                {bond.propertyValue > 0 && <Metric label="LTV ratio" value={pct(bond.balance / bond.propertyValue)} small />}
+              </div>
+            )}
+            {state.bonds.length > 1 && (
+              <button onClick={() => dispatch({ type: "REMOVE_BOND", payload: i })} className="text-xs mt-2 px-2 py-1 rounded" style={{ color: COLORS.red }}>Remove</button>
+            )}
+          </Card>
+        );
+      })}
+
+      <div className="flex items-center justify-between mb-3 mt-6">
+        <h3 className="text-sm font-semibold" style={{ color: COLORS.text }}>Other debt</h3>
+        <button onClick={() => dispatch({ type: "ADD_DEBT" })} className="text-xs px-3 py-1 rounded-lg" style={{ background: COLORS.red + "20", color: COLORS.red }}>
+          + Add debt
+        </button>
+      </div>
+      {state.otherDebts.length === 0 && <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>No other debts. Add vehicle finance, credit cards, personal loans etc.</p>}
+      {state.otherDebts.map((debt, i) => (
+        <Card key={i} accent={COLORS.red}>
+          <div className="grid grid-cols-2 gap-2">
+            <Input label="Description" value={debt.name} onChange={(v) => dispatch({ type: "SET_DEBT", payload: { idx: i, data: { name: v } } })} prefix="" type="text" small />
+            <Input label="Balance" value={debt.balance} onChange={(v) => dispatch({ type: "SET_DEBT", payload: { idx: i, data: { balance: v } } })} small />
+            <Input label="Interest rate" value={debt.rate} onChange={(v) => dispatch({ type: "SET_DEBT", payload: { idx: i, data: { rate: v } } })} prefix="" suffix="%" small />
+            <Input label="Monthly payment" value={debt.monthlyPayment} onChange={(v) => dispatch({ type: "SET_DEBT", payload: { idx: i, data: { monthlyPayment: v } } })} small />
+          </div>
+          <button onClick={() => dispatch({ type: "REMOVE_DEBT", payload: i })} className="text-xs mt-1 px-2 py-1 rounded" style={{ color: COLORS.red }}>Remove</button>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+function StepChildren({ state, dispatch }) {
+  if (state.children.length === 0) {
+    return (
+      <div>
+        <SectionTitle>Children</SectionTitle>
+        <p className="text-sm mb-4" style={{ color: COLORS.textDim }}>No children added. Go back to Household to add children.</p>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <SectionTitle>Children – costs & investments</SectionTitle>
+      {state.children.map((child, i) => {
+        const yearsTo18 = Math.max(0, 18 - child.age);
+        const totalDonations = (child.donationFromP1 || 0) + (child.donationFromP2 || 0);
+        return (
+          <Card key={i} title={`${child.name} (age ${child.age})`} accent={COLORS.purple}>
+            <Input label="Monthly costs (school, activities, etc)" value={child.monthlyCosts} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { monthlyCosts: v } } })} />
+            <Input label="Annual school/education fees" value={child.schoolFeesAnnual} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { schoolFeesAnnual: v } } })} help={`At ${state.returns.educationInflation}% education inflation, projected total to age ${child.endEducationAge}: ${fmtFull(child.schoolFeesAnnual > 0 ? Array.from({ length: Math.max(0, child.endEducationAge - child.age) }, (_, y) => child.schoolFeesAnnual * Math.pow(1 + state.returns.educationInflation / 100, y)).reduce((a, b) => a + b, 0) : 0)}`} />
+            <Input label="End-of-education age" value={child.endEducationAge} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { endEducationAge: v } } })} prefix="" suffix="yrs" />
+
+            <h4 className="text-xs font-semibold mt-4 mb-2" style={{ color: COLORS.textMuted }}>Investments in {child.name}'s name</h4>
+            <Input label="Discretionary investment balance" value={child.discretionaryBalance} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { discretionaryBalance: v } } })} />
+
+            <h4 className="text-xs font-semibold mt-4 mb-2" style={{ color: COLORS.textMuted }}>Annual donations to {child.name}</h4>
+            <Input label={`From ${state.persons[0].name}`} value={child.donationFromP1} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { donationFromP1: v } } })} />
+            {state.hasSpouse && (
+              <Input label={`From ${state.persons[1].name}`} value={child.donationFromP2} onChange={(v) => dispatch({ type: "SET_CHILD", payload: { idx: i, data: { donationFromP2: v } } })} />
+            )}
+
+            <Tip type="info">
+              <strong>Section 7(3)–(6) attribution rules:</strong> Interest and dividends earned by a minor on donated assets are taxed in the donor's hands. Capital gains are NOT attributed. For this reason, equity growth ETFs are preferable over income-producing assets for children's discretionary investments.
+            </Tip>
+
+            {yearsTo18 > 0 && child.tfsaAnnualContrib > 0 && (
+              <Metric
+                label={`Projected TFSA at age 18 (${yearsTo18} years)`}
+                value={fmtFull(
+                  Array.from({ length: yearsTo18 }, (_, y) => 0).reduce((bal) => {
+                    return (bal + child.tfsaAnnualContrib) * (1 + state.returns.tfsa / 100);
+                  }, child.tfsaBalance)
+                )}
+                color={COLORS.green}
+              />
+            )}
+          </Card>
+        );
+      })}
+
+      {/* Donations tax summary */}
+      {state.persons.map((p, idx) => {
+        const totalDonations = state.children.reduce((s, c) => s + (idx === 0 ? c.donationFromP1 : c.donationFromP2), 0);
+        if (totalDonations <= 0) return null;
+        const excess = Math.max(0, totalDonations - DONATION_EXEMPT);
+        return (
+          <Card key={`don-${idx}`} title={`${p.name} – donations tax`} accent={COLORS.amber}>
+            <Metric label="Total annual donations" value={fmtFull(totalDonations)} small />
+            <Metric label="Exempt amount" value={fmtFull(DONATION_EXEMPT)} color={COLORS.green} small />
+            {excess > 0 ? (
+              <Metric label="Donations tax payable (20%)" value={fmtFull(excess * DONATION_TAX_RATE)} color={COLORS.red} small />
+            ) : (
+              <Metric label="Within exemption" value="No donations tax" color={COLORS.green} small />
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+function StepBudget({ state, dispatch }) {
+  const personCalcs = state.persons.map((p) => {
+    const totalRA = (p.raContribSelf || 0) + (p.raContribEmployer || 0);
+    const raDeductible = Math.min(totalRA, Math.min(p.grossIncome * RA_RATE, RA_CAP));
+    const taxableIncome = Math.max(0, p.grossIncome - raDeductible);
+    const grossTax = calcTax(taxableIncome, p.age);
+    const medCredits = calcMedCredits(p.hasMedicalAid, p.medDependants);
+    const tax = Math.max(0, grossTax - medCredits);
+    const uif = calcUIF(p.grossIncome);
+    const netIncome = p.grossIncome - tax - uif - (p.raDeductedFromPayroll ? totalRA : 0);
+    return { tax, uif, netIncome, totalRA };
+  });
+
+  const totalNetMonthly = personCalcs.reduce((s, c) => s + c.netIncome, 0) / 12;
+
+  const totalBondPayments = state.bonds.reduce((s, b) => s + (b.balance > 0 ? calcBondPayment(b.balance, b.rate / 100, b.termMonths) : 0), 0);
+  const totalDebtPayments = state.otherDebts.reduce((s, d) => s + d.monthlyPayment, 0);
+  const childCosts = state.children.reduce((s, c) => s + c.monthlyCosts, 0);
+  const tfsaMonthly = state.persons.reduce((s, p) => s + p.tfsaAnnualContrib, 0) / 12 + state.children.reduce((s, c) => s + c.tfsaAnnualContrib, 0) / 12;
+
+  // RA contributions already deducted if payroll
+  const raNotPayroll = state.persons.reduce((s, p) => s + (p.raDeductedFromPayroll ? 0 : ((p.raContribSelf || 0) + (p.raContribEmployer || 0))), 0) / 12;
+
+  const totalCommitments = state.monthlyExpenses + totalBondPayments + totalDebtPayments + childCosts + tfsaMonthly + raNotPayroll;
+  const surplus = totalNetMonthly - totalCommitments;
+
+  return (
+    <div>
+      <SectionTitle>Monthly budget</SectionTitle>
+      <Input label="Monthly living expenses (excl. bonds, debt, child costs)" value={state.monthlyExpenses} onChange={(v) => dispatch({ type: "SET", payload: { monthlyExpenses: v } })} help="Food, utilities, transport, insurance, entertainment, etc." />
+
+      <Input label="Any available lump sum to deploy" value={state.lumpSum} onChange={(v) => dispatch({ type: "SET", payload: { lumpSum: v } })} help="Bonus, inheritance, savings – we'll suggest the optimal allocation" />
+
+      <Card title="Monthly cash flow" accent={surplus >= 0 ? COLORS.green : COLORS.red}>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+          <Metric label="Net income" value={fmtFull(totalNetMonthly)} color={COLORS.green} small />
+          <div />
+          <Metric label="Living expenses" value={`-${fmtFull(state.monthlyExpenses)}`} color={COLORS.red} small />
+          <Metric label="Bond repayments" value={`-${fmtFull(totalBondPayments)}`} color={COLORS.red} small />
+          {totalDebtPayments > 0 && <Metric label="Other debt" value={`-${fmtFull(totalDebtPayments)}`} color={COLORS.red} small />}
+          {childCosts > 0 && <Metric label="Children costs" value={`-${fmtFull(childCosts)}`} color={COLORS.purple} small />}
+          {tfsaMonthly > 0 && <Metric label="TFSA contributions" value={`-${fmtFull(tfsaMonthly)}`} color={COLORS.accent} small />}
+          {raNotPayroll > 0 && <Metric label="RA (not payroll)" value={`-${fmtFull(raNotPayroll)}`} color={COLORS.amber} small />}
+        </div>
+        <div className="mt-3 pt-3" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+          <Metric label="Monthly surplus / deficit" value={fmtFull(surplus)} color={surplus >= 0 ? COLORS.green : COLORS.red} />
+        </div>
+        {surplus < 0 && <Tip type="warn">You're spending more than you earn. Review expenses or increase income before investing.</Tip>}
+        {surplus > 0 && surplus < totalNetMonthly * 0.1 && <Tip type="info">Your savings rate is below 10%. Consider whether you can redirect more towards investments.</Tip>}
+      </Card>
+
+      {state.lumpSum > 0 && (
+        <Card title="Lump sum deployment waterfall" accent={COLORS.accent}>
+          <p className="text-xs mb-3" style={{ color: COLORS.textDim }}>Recommended allocation priority:</p>
+          {(() => {
+            let remaining = state.lumpSum;
+            const allocs = [];
+            // 1. TFSA
+            const tfsaRoom = state.persons.reduce((s, p) => s + Math.min(TFSA_ANNUAL - p.tfsaAnnualContrib, Math.max(0, TFSA_LIFETIME - p.tfsaLifetimeContributed) - p.tfsaAnnualContrib), 0);
+            if (tfsaRoom > 0 && remaining > 0) {
+              const amt = Math.min(remaining, tfsaRoom);
+              allocs.push({ label: "TFSA top-up", amt, why: "Tax-free growth – always fill this first" });
+              remaining -= amt;
+            }
+            // 2. RA top-up
+            const raRoom = state.persons.reduce((s, p) => {
+              const maxD = Math.min(p.grossIncome * RA_RATE, RA_CAP);
+              const current = (p.raContribSelf || 0) + (p.raContribEmployer || 0);
+              return s + Math.max(0, maxD - current);
+            }, 0);
+            if (raRoom > 0 && remaining > 0) {
+              const amt = Math.min(remaining, raRoom);
+              allocs.push({ label: "RA top-up", amt, why: "Immediate tax deduction at your marginal rate" });
+              remaining -= amt;
+            }
+            // 3. Emergency fund
+            const emergencyTarget = state.monthlyExpenses * state.emergencyFundTarget;
+            const currentCash = state.persons.reduce((s, p) => s + p.cashSavings, 0);
+            const emergencyGap = Math.max(0, emergencyTarget - currentCash);
+            if (emergencyGap > 0 && remaining > 0) {
+              const amt = Math.min(remaining, emergencyGap);
+              allocs.push({ label: `Emergency fund (${state.emergencyFundTarget} months)`, amt, why: "Liquidity buffer before paying down debt" });
+              remaining -= amt;
+            }
+            // 4. Highest-rate debt
+            const highRateDebt = [...state.bonds, ...state.otherDebts].filter(d => d.balance > 0).sort((a, b) => b.rate - a.rate);
+            for (const d of highRateDebt) {
+              if (remaining <= 0) break;
+              const amt = Math.min(remaining, d.balance);
+              allocs.push({ label: `Pay down ${d.name || "debt"} (${d.rate}%)`, amt, why: `Guaranteed ${d.rate}% after-tax return` });
+              remaining -= amt;
+            }
+            // 5. Discretionary
+            if (remaining > 0) {
+              allocs.push({ label: "Discretionary equity investment", amt: remaining, why: "Long-term growth in a taxable wrapper" });
+              remaining = 0;
+            }
+            return allocs.map((a, i) => (
+              <div key={i} className="flex items-center justify-between py-2" style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                <div>
+                  <div className="text-sm font-medium" style={{ color: COLORS.text }}>{i + 1}. {a.label}</div>
+                  <div className="text-xs" style={{ color: COLORS.textDim }}>{a.why}</div>
+                </div>
+                <div className="font-mono text-sm font-bold" style={{ color: COLORS.green }}>{fmtFull(a.amt)}</div>
+              </div>
+            ));
+          })()}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function StepNetPosition({ state }) {
+  // Assets
+  const propertyValue = state.bonds.reduce((s, b) => s + (b.propertyValue || 0), 0);
+  const retirementTotal = state.persons.reduce((s, p) => s + (p.pensionBalance || 0), 0);
+  const tfsaTotal = state.persons.reduce((s, p) => s + (p.tfsaBalance || 0), 0) + state.children.reduce((s, c) => s + (c.tfsaBalance || 0), 0);
+  const discretionary = state.persons.reduce((s, p) => s + (p.discretionaryInvestments || 0), 0) + state.children.reduce((s, c) => s + (c.discretionaryBalance || 0), 0);
+  const cash = state.persons.reduce((s, p) => s + (p.cashSavings || 0), 0);
+  const otherAssetsTotal = state.otherAssets.reduce((s, a) => s + a.value, 0);
+  const totalAssets = propertyValue + retirementTotal + tfsaTotal + discretionary + cash + otherAssetsTotal;
+
+  // Liabilities
+  const totalBonds = state.bonds.reduce((s, b) => s + b.balance, 0);
+  const totalOtherDebt = state.otherDebts.reduce((s, d) => s + d.balance, 0);
+  const totalLiabilities = totalBonds + totalOtherDebt;
+
+  const netWorth = totalAssets - totalLiabilities;
+  const liquidNetWorth = (tfsaTotal + discretionary + cash + otherAssetsTotal) - totalOtherDebt;
+
+  const monthlyGross = state.persons.reduce((s, p) => s + p.grossIncome, 0) / 12;
+  const monthlyDebtPayments = state.bonds.reduce((s, b) => s + (b.balance > 0 ? calcBondPayment(b.balance, b.rate / 100, b.termMonths) : 0), 0) + state.otherDebts.reduce((s, d) => s + d.monthlyPayment, 0);
+  const dti = monthlyGross > 0 ? monthlyDebtPayments / monthlyGross : 0;
+
+  return (
+    <div>
+      <SectionTitle>Household net position</SectionTitle>
+
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        <Card title="Total assets" accent={COLORS.green}>
+          <Metric label="Net worth" value={fmtFull(netWorth)} color={netWorth >= 0 ? COLORS.green : COLORS.red} />
+        </Card>
+        <Card title="Liquid net worth" accent={COLORS.accent}>
+          <Metric label="Accessible wealth" value={fmtFull(liquidNetWorth)} color={liquidNetWorth >= 0 ? COLORS.green : COLORS.red} />
+          <p className="text-xs" style={{ color: COLORS.textDim }}>Excludes property and retirement</p>
+        </Card>
+      </div>
+
+      <Card title="Assets breakdown">
+        <div className="space-y-2">
+          {[
+            { label: "Property", value: propertyValue, color: COLORS.orange },
+            { label: "Retirement funds", value: retirementTotal, color: COLORS.amber },
+            { label: "TFSAs", value: tfsaTotal, color: COLORS.green },
+            { label: "Discretionary investments", value: discretionary, color: COLORS.accent },
+            { label: "Cash & savings", value: cash, color: COLORS.teal },
+            { label: "Other assets", value: otherAssetsTotal, color: COLORS.purple },
+          ].filter(a => a.value > 0).map((a, i) => (
+            <div key={i} className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 rounded-sm" style={{ background: a.color }} />
+                <span className="text-sm" style={{ color: COLORS.text }}>{a.label}</span>
+              </div>
+              <span className="font-mono text-sm" style={{ color: COLORS.text }}>{fmtFull(a.value)}</span>
+            </div>
+          ))}
+          <div className="pt-2 mt-2 flex justify-between font-bold" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+            <span className="text-sm" style={{ color: COLORS.text }}>Total assets</span>
+            <span className="font-mono text-sm" style={{ color: COLORS.green }}>{fmtFull(totalAssets)}</span>
+          </div>
+        </div>
+      </Card>
+
+      <Card title="Liabilities">
+        {state.bonds.filter(b => b.balance > 0).map((b, i) => (
+          <div key={i} className="flex justify-between mb-1">
+            <span className="text-sm" style={{ color: COLORS.text }}>{b.name}</span>
+            <span className="font-mono text-sm" style={{ color: COLORS.red }}>{fmtFull(b.balance)}</span>
+          </div>
+        ))}
+        {state.otherDebts.filter(d => d.balance > 0).map((d, i) => (
+          <div key={i} className="flex justify-between mb-1">
+            <span className="text-sm" style={{ color: COLORS.text }}>{d.name || "Other debt"}</span>
+            <span className="font-mono text-sm" style={{ color: COLORS.red }}>{fmtFull(d.balance)}</span>
+          </div>
+        ))}
+        <div className="pt-2 mt-2 flex justify-between font-bold" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+          <span className="text-sm" style={{ color: COLORS.text }}>Total liabilities</span>
+          <span className="font-mono text-sm" style={{ color: COLORS.red }}>{fmtFull(totalLiabilities)}</span>
+        </div>
+      </Card>
+
+      <Card title="Key ratios">
+        <div className="grid grid-cols-2 gap-4">
+          <Metric label="Debt-to-income" value={pct(dti)} color={dti > 0.4 ? COLORS.red : dti > 0.3 ? COLORS.amber : COLORS.green} />
+          <Metric label="Savings rate" value={(() => {
+            const personCalcs = state.persons.map(p => {
+              const totalRA = (p.raContribSelf || 0) + (p.raContribEmployer || 0);
+              const raDeductible = Math.min(totalRA, Math.min(p.grossIncome * RA_RATE, RA_CAP));
+              const taxableIncome = Math.max(0, p.grossIncome - raDeductible);
+              const tax = Math.max(0, calcTax(taxableIncome, p.age) - calcMedCredits(p.hasMedicalAid, p.medDependants));
+              return p.grossIncome - tax - calcUIF(p.grossIncome) - (p.raDeductedFromPayroll ? totalRA : 0);
+            });
+            const netMonthly = personCalcs.reduce((s, n) => s + n, 0) / 12;
+            const totalSavings = state.persons.reduce((s, p) => s + p.tfsaAnnualContrib + (p.raDeductedFromPayroll ? 0 : (p.raContribSelf || 0)), 0) / 12;
+            return netMonthly > 0 ? pct(totalSavings / netMonthly) : "0%";
+          })()} color={COLORS.accent} />
+        </div>
+        {dti > 0.4 && <Tip type="warn">Your debt-to-income ratio is above 40% – this is considered high-risk by most lenders and limits your financial flexibility.</Tip>}
+      </Card>
+
+      <div className="flex items-center justify-between mb-3 mt-4">
+        <h3 className="text-sm font-semibold" style={{ color: COLORS.text }}>Other assets</h3>
+        <button onClick={() => {}} className="text-xs px-3 py-1 rounded-lg" style={{ background: COLORS.accent + "20", color: COLORS.accent }}>
+          Managed in inputs
+        </button>
+      </div>
+      <p className="text-xs" style={{ color: COLORS.textDim }}>Add discretionary investments and cash savings on the Income and TFSA steps. Other assets can be added below.</p>
+    </div>
+  );
+}
+
+function StepProjection({ state, dispatch }) {
+  const projectionData = useMemo(() => {
+    const years = state.projectionYears || 20;
+    const r = state.returns;
+    const data = [];
+
+    // Initial values
+    let tfsaVal = state.persons.reduce((s, p) => s + (p.tfsaBalance || 0), 0);
+    let raVal = state.persons.reduce((s, p) => s + (p.pensionBalance || 0), 0);
+    let equityVal = state.persons.reduce((s, p) => s + (p.discretionaryInvestments || 0), 0);
+    let cashVal = state.persons.reduce((s, p) => s + (p.cashSavings || 0), 0);
+    let bondBals = state.bonds.map(b => b.balance);
+    let childTfsa = state.children.map(c => c.tfsaBalance || 0);
+    let propertyVal = state.bonds.reduce((s, b) => s + (b.propertyValue || 0), 0);
+
+    const annualTfsaContrib = state.persons.reduce((s, p) => s + p.tfsaAnnualContrib, 0);
+    const annualRaContrib = state.persons.reduce((s, p) => s + (p.raContribSelf || 0), 0);
+
+    // Monthly surplus for reinvestment
+    const personCalcs = state.persons.map(p => {
+      const totalRA = (p.raContribSelf || 0) + (p.raContribEmployer || 0);
+      const raDeductible = Math.min(totalRA, Math.min(p.grossIncome * RA_RATE, RA_CAP));
+      const taxableIncome = Math.max(0, p.grossIncome - raDeductible);
+      const tax = Math.max(0, calcTax(taxableIncome, p.age) - calcMedCredits(p.hasMedicalAid, p.medDependants));
+      const uif = calcUIF(p.grossIncome);
+      return p.grossIncome - tax - uif - (p.raDeductedFromPayroll ? totalRA : 0);
+    });
+    const totalNetAnnual = personCalcs.reduce((s, n) => s + n, 0);
+    const totalBondPaymentsAnnual = state.bonds.reduce((s, b) => s + (b.balance > 0 ? calcBondPayment(b.balance, b.rate / 100, b.termMonths) * 12 : 0), 0);
+    const totalDebtPaymentsAnnual = state.otherDebts.reduce((s, d) => s + d.monthlyPayment * 12, 0);
+    const childCostsAnnual = state.children.reduce((s, c) => s + c.monthlyCosts * 12, 0);
+    const expensesAnnual = state.monthlyExpenses * 12;
+    const childTfsaAnnual = state.children.reduce((s, c) => s + c.tfsaAnnualContrib, 0);
+
+    let annualSurplus = totalNetAnnual - expensesAnnual - totalBondPaymentsAnnual - totalDebtPaymentsAnnual - childCostsAnnual - annualTfsaContrib - childTfsaAnnual;
+    // If RA not payroll, subtract
+    annualSurplus -= state.persons.reduce((s, p) => s + (p.raDeductedFromPayroll ? 0 : ((p.raContribSelf || 0) + (p.raContribEmployer || 0))), 0);
+
+    // Apply lump sum in year 0
+    let lumpRemaining = state.lumpSum || 0;
+    // Simplified: add lump sum to equity
+    equityVal += lumpRemaining;
+
+    for (let y = 0; y <= years; y++) {
+      const totalDebt = bondBals.reduce((s, b) => s + b, 0) + state.otherDebts.reduce((s, d) => s + Math.max(0, d.balance * Math.pow(1 - 0.5, y)), 0);
+      const totalChildTfsa = childTfsa.reduce((s, v) => s + v, 0);
+
+      data.push({
+        year: y,
+        label: `Year ${y}`,
+        tfsa: Math.round(tfsaVal + totalChildTfsa),
+        retirement: Math.round(raVal),
+        equity: Math.round(equityVal),
+        property: Math.round(propertyVal),
+        cash: Math.round(cashVal),
+        debt: -Math.round(totalDebt),
+        netWorth: Math.round(tfsaVal + totalChildTfsa + raVal + equityVal + propertyVal + cashVal - totalDebt),
+        netWorthReal: Math.round((tfsaVal + totalChildTfsa + raVal + equityVal + propertyVal + cashVal - totalDebt) / Math.pow(1 + r.inflation / 100, y)),
+      });
+
+      if (y >= years) break;
+
+      // Grow assets
+      tfsaVal = (tfsaVal + annualTfsaContrib) * (1 + r.tfsa / 100);
+      raVal = (raVal + annualRaContrib) * (1 + r.ra / 100);
+      equityVal = (equityVal + Math.max(0, annualSurplus)) * (1 + r.equity / 100);
+      propertyVal = propertyVal * (1 + r.property / 100);
+      cashVal = cashVal * (1 + r.moneyMarket / 100 * (1 - 0.3)); // rough after-tax
+
+      // Amortise bonds
+      bondBals = bondBals.map((bal, i) => {
+        if (bal <= 0) return 0;
+        const b = state.bonds[i];
+        const monthly = calcBondPayment(b.balance, b.rate / 100, b.termMonths);
+        return amortiseBondYear(bal, b.rate / 100, monthly);
+      });
+
+      // Freed bond cash → equity when bond paid off (simplified)
+
+      // Children TFSAs
+      childTfsa = childTfsa.map((val, i) => {
+        const child = state.children[i];
+        if (!child) return val;
+        const childAge = child.age + y + 1;
+        if (childAge >= 18) return val * (1 + r.tfsa / 100); // stop contributions, keep compounding
+        return (val + child.tfsaAnnualContrib) * (1 + r.tfsa / 100);
+      });
+    }
+    return data;
+  }, [state]);
+
+  // Find milestones
+  const debtFreeYear = projectionData.find(d => d.debt >= 0 && d.year > 0)?.year;
+  const annualExpenses = state.monthlyExpenses * 12;
+  const fiNumber = annualExpenses * 25;
+  const fiYear = projectionData.find(d => d.netWorth >= fiNumber && fiNumber > 0)?.year;
+
+  return (
+    <div>
+      <SectionTitle>Wealth projection</SectionTitle>
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <Input label="Projection horizon" value={state.projectionYears} onChange={(v) => dispatch({ type: "SET", payload: { projectionYears: v } })} prefix="" suffix="years" />
+        <Input label="Inflation" value={state.returns.inflation} onChange={(v) => dispatch({ type: "SET_RETURNS", payload: { inflation: v } })} prefix="" suffix="%" />
+      </div>
+
+      <Card title="Return assumptions" subtitle="Adjust to match your expectations">
+        <div className="grid grid-cols-3 gap-2">
+          <Input label="TFSA" value={state.returns.tfsa} onChange={(v) => dispatch({ type: "SET_RETURNS", payload: { tfsa: v } })} prefix="" suffix="%" small />
+          <Input label="Retirement" value={state.returns.ra} onChange={(v) => dispatch({ type: "SET_RETURNS", payload: { ra: v } })} prefix="" suffix="%" small />
+          <Input label="Equity" value={state.returns.equity} onChange={(v) => dispatch({ type: "SET_RETURNS", payload: { equity: v } })} prefix="" suffix="%" small />
+          <Input label="Property" value={state.returns.property} onChange={(v) => dispatch({ type: "SET_RETURNS", payload: { property: v } })} prefix="" suffix="%" small />
+          <Input label="Money market" value={state.returns.moneyMarket} onChange={(v) => dispatch({ type: "SET_RETURNS", payload: { moneyMarket: v } })} prefix="" suffix="%" small />
+        </div>
+      </Card>
+
+      {/* Milestones */}
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        {debtFreeYear && (
+          <Card accent={COLORS.green}>
+            <Metric label="Debt-free by" value={`Year ${debtFreeYear}`} color={COLORS.green} />
+          </Card>
+        )}
+        {fiYear && (
+          <Card accent={COLORS.accent}>
+            <Metric label="FI number reached" value={`Year ${fiYear}`} color={COLORS.accent} />
+            <p className="text-xs" style={{ color: COLORS.textDim }}>25× annual expenses = {fmtFull(fiNumber)}</p>
+          </Card>
+        )}
+      </div>
+
+      {/* Projection chart */}
+      <Card title="Asset growth projection (nominal)">
+        <div style={{ width: "100%", height: 320 }}>
+          <ResponsiveContainer>
+            <AreaChart data={projectionData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+              <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} interval={Math.floor(projectionData.length / 6)} />
+              <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickFormatter={(v) => fmt(v)} width={60} />
+              <Tooltip
+                contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 8, fontSize: 12 }}
+                labelStyle={{ color: COLORS.text }}
+                formatter={(v) => [fmtFull(v), undefined]}
+              />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Area type="monotone" dataKey="tfsa" stackId="1" stroke={COLORS.green} fill={COLORS.green + "40"} name="TFSA" />
+              <Area type="monotone" dataKey="retirement" stackId="1" stroke={COLORS.amber} fill={COLORS.amber + "40"} name="Retirement" />
+              <Area type="monotone" dataKey="equity" stackId="1" stroke={COLORS.accent} fill={COLORS.accent + "40"} name="Equity" />
+              <Area type="monotone" dataKey="property" stackId="1" stroke={COLORS.orange} fill={COLORS.orange + "40"} name="Property" />
+              <Area type="monotone" dataKey="cash" stackId="1" stroke={COLORS.teal} fill={COLORS.teal + "40"} name="Cash" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </Card>
+
+      <Card title="Net worth trajectory">
+        <div style={{ width: "100%", height: 250 }}>
+          <ResponsiveContainer>
+            <AreaChart data={projectionData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+              <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} interval={Math.floor(projectionData.length / 6)} />
+              <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickFormatter={(v) => fmt(v)} width={60} />
+              <Tooltip
+                contentStyle={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: 8, fontSize: 12 }}
+                formatter={(v) => [fmtFull(v), undefined]}
+              />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Area type="monotone" dataKey="netWorth" stroke={COLORS.accent} fill={COLORS.accent + "30"} name="Nominal" />
+              <Area type="monotone" dataKey="netWorthReal" stroke={COLORS.green} fill={COLORS.green + "20"} strokeDasharray="5 5" name="Real (inflation-adjusted)" />
+              {fiNumber > 0 && <ReferenceLine y={fiNumber} stroke={COLORS.purple} strokeDasharray="8 4" label={{ value: "FI number", fill: COLORS.purple, fontSize: 10 }} />}
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </Card>
+
+      {/* Data table */}
+      <Card title="Year-by-year summary">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs" style={{ color: COLORS.text }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                <th className="text-left py-1 pr-2">Year</th>
+                <th className="text-right py-1 px-1">TFSA</th>
+                <th className="text-right py-1 px-1">Retirement</th>
+                <th className="text-right py-1 px-1">Equity</th>
+                <th className="text-right py-1 px-1">Debt</th>
+                <th className="text-right py-1 px-1 font-bold">Net worth</th>
+                <th className="text-right py-1 px-1">Real</th>
+              </tr>
+            </thead>
+            <tbody>
+              {projectionData.filter((_, i) => i % (state.projectionYears > 15 ? 5 : state.projectionYears > 8 ? 2 : 1) === 0 || _ === projectionData[projectionData.length - 1]).map((d) => (
+                <tr key={d.year} style={{ borderBottom: `1px solid ${COLORS.border}22` }}>
+                  <td className="py-1 pr-2 font-mono">{d.year}</td>
+                  <td className="text-right py-1 px-1 font-mono" style={{ color: COLORS.green }}>{fmt(d.tfsa)}</td>
+                  <td className="text-right py-1 px-1 font-mono" style={{ color: COLORS.amber }}>{fmt(d.retirement)}</td>
+                  <td className="text-right py-1 px-1 font-mono" style={{ color: COLORS.accent }}>{fmt(d.equity)}</td>
+                  <td className="text-right py-1 px-1 font-mono" style={{ color: COLORS.red }}>{fmt(d.debt)}</td>
+                  <td className="text-right py-1 px-1 font-mono font-bold">{fmt(d.netWorth)}</td>
+                  <td className="text-right py-1 px-1 font-mono" style={{ color: COLORS.textDim }}>{fmt(d.netWorthReal)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      <Tip type="info">
+        This projection is illustrative and based on constant return assumptions. Actual returns will vary year to year. It does not constitute financial advice. Consult a registered financial adviser for personalised planning.
+      </Tip>
+    </div>
+  );
+}
+
+// ─── Additional inputs on Net Position for other assets ───
+function StepNetPositionFull({ state, dispatch }) {
+  return (
+    <div>
+      <SectionTitle>Net position — additional inputs</SectionTitle>
+      <p className="text-xs mb-4" style={{ color: COLORS.textDim }}>Add discretionary investments, cash, and other assets here.</p>
+
+      {state.persons.map((p, idx) => (
+        <Card key={idx} title={p.name} accent={idx === 0 ? COLORS.accent : COLORS.teal}>
+          <Input label="Discretionary investments" value={p.discretionaryInvestments} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { discretionaryInvestments: v } } })} help="Unit trusts, ETFs, shares outside of RA/TFSA" />
+          <Input label="Cash & savings" value={p.cashSavings} onChange={(v) => dispatch({ type: "SET_PERSON", payload: { idx, data: { cashSavings: v } } })} help="Bank accounts, money market, emergency fund" />
+        </Card>
+      ))}
+
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold" style={{ color: COLORS.text }}>Other assets</h3>
+        <button onClick={() => dispatch({ type: "ADD_ASSET" })} className="text-xs px-3 py-1 rounded-lg" style={{ background: COLORS.accent + "20", color: COLORS.accent }}>
+          + Add asset
+        </button>
+      </div>
+      {state.otherAssets.map((asset, i) => (
+        <Card key={i}>
+          <div className="grid grid-cols-2 gap-2">
+            <Input label="Description" value={asset.name} onChange={(v) => dispatch({ type: "SET_ASSET", payload: { idx: i, data: { name: v } } })} prefix="" type="text" small />
+            <Input label="Value" value={asset.value} onChange={(v) => dispatch({ type: "SET_ASSET", payload: { idx: i, data: { value: v } } })} small />
+          </div>
+          <button onClick={() => dispatch({ type: "REMOVE_ASSET", payload: i })} className="text-xs mt-1" style={{ color: COLORS.red }}>Remove</button>
+        </Card>
+      ))}
+
+      <Input label="Emergency fund target" value={state.emergencyFundTarget} onChange={(v) => dispatch({ type: "SET", payload: { emergencyFundTarget: v } })} prefix="" suffix="months of expenses" help="How many months of living expenses to keep in cash" />
+
+      <StepNetPosition state={state} />
+    </div>
+  );
+}
+
+// ─── Main App ───
+function App() {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const mainRef = useRef(null);
+
+  const goTo = (step) => {
+    dispatch({ type: "SET", payload: { step } });
+    if (mainRef.current) mainRef.current.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const stepContent = () => {
+    switch (state.step) {
+      case 0: return <StepHousehold state={state} dispatch={dispatch} />;
+      case 1: return <StepIncomeTax state={state} dispatch={dispatch} />;
+      case 2: return <StepRetirement state={state} dispatch={dispatch} />;
+      case 3: return <StepTFSA state={state} dispatch={dispatch} />;
+      case 4: return <StepProperty state={state} dispatch={dispatch} />;
+      case 5: return <StepChildren state={state} dispatch={dispatch} />;
+      case 6: return <StepBudget state={state} dispatch={dispatch} />;
+      case 7: return <StepNetPositionFull state={state} dispatch={dispatch} />;
+      case 8: return <StepProjection state={state} dispatch={dispatch} />;
+      default: return null;
+    }
+  };
+
+  // Quick summary for sidebar
+  const quickSummary = useMemo(() => {
+    const p = state.persons[0];
+    const totalRA = (p.raContribSelf || 0) + (p.raContribEmployer || 0);
+    const raDeductible = Math.min(totalRA, Math.min(p.grossIncome * RA_RATE, RA_CAP));
+    const taxableIncome = Math.max(0, p.grossIncome - raDeductible);
+    const grossTax = calcTax(taxableIncome, p.age);
+    const medCredits = calcMedCredits(p.hasMedicalAid, p.medDependants);
+    const tax = Math.max(0, grossTax - medCredits);
+    const uif = calcUIF(p.grossIncome);
+    const netIncome = p.grossIncome - tax - uif - (p.raDeductedFromPayroll ? totalRA : 0);
+
+    const totalAssets = state.persons.reduce((s, p) => s + (p.tfsaBalance || 0) + (p.pensionBalance || 0) + (p.discretionaryInvestments || 0) + (p.cashSavings || 0), 0) +
+      state.bonds.reduce((s, b) => s + (b.propertyValue || 0), 0) +
+      state.otherAssets.reduce((s, a) => s + a.value, 0);
+    const totalDebt = state.bonds.reduce((s, b) => s + b.balance, 0) + state.otherDebts.reduce((s, d) => s + d.balance, 0);
+
+    return { tax, uif, netIncome, totalAssets, totalDebt, netWorth: totalAssets - totalDebt, grossIncome: p.grossIncome };
+  }, [state]);
+
+  return (
+    <div style={{ background: COLORS.bg, color: COLORS.text, minHeight: "100vh", fontFamily: "'Outfit', 'Segoe UI', sans-serif" }}>
+      {/* Header */}
+      <div className="px-4 py-3 flex items-center justify-between" style={{ borderBottom: `1px solid ${COLORS.border}`, background: COLORS.card }}>
+        <div>
+          <h1 className="text-lg font-bold tracking-tight" style={{ color: COLORS.text }}>
+            <span style={{ color: COLORS.accent }}>SA</span> Household wealth calculator
+          </h1>
+          <p className="text-xs" style={{ color: COLORS.textDim }}>SARS 2027 tax year · Not financial advice</p>
+        </div>
+        <div className="text-right">
+          {quickSummary.grossIncome > 0 && (
+            <>
+              <div className="text-xs" style={{ color: COLORS.textDim }}>Net worth</div>
+              <div className="font-mono text-sm font-bold" style={{ color: quickSummary.netWorth >= 0 ? COLORS.green : COLORS.red }}>
+                {fmtFull(quickSummary.netWorth)}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="flex" style={{ height: "calc(100vh - 52px)" }}>
+        {/* Sidebar nav */}
+        <div className="w-48 shrink-0 overflow-y-auto py-2" style={{ borderRight: `1px solid ${COLORS.border}`, background: COLORS.card }}>
+          {STEPS.map((s, i) => (
+            <button
+              key={s.id}
+              onClick={() => goTo(i)}
+              className="w-full text-left px-3 py-2 text-sm flex items-center gap-2 transition-colors"
+              style={{
+                color: state.step === i ? COLORS.accent : COLORS.textMuted,
+                background: state.step === i ? COLORS.accent + "10" : "transparent",
+                borderLeft: state.step === i ? `3px solid ${COLORS.accent}` : "3px solid transparent",
+              }}
+            >
+              <span>{s.icon}</span>
+              <span className="truncate">{s.label}</span>
+            </button>
+          ))}
+
+          {/* Sidebar summary */}
+          {quickSummary.grossIncome > 0 && (
+            <div className="mt-4 mx-3 p-3 rounded-lg" style={{ background: COLORS.bg, border: `1px solid ${COLORS.border}` }}>
+              <div className="text-xs font-semibold mb-2" style={{ color: COLORS.textDim }}>Quick summary</div>
+              <Metric label="Gross" value={fmt(quickSummary.grossIncome)} small />
+              <Metric label="Tax + UIF" value={fmt(quickSummary.tax + quickSummary.uif)} color={COLORS.red} small />
+              <Metric label="Net annual" value={fmt(quickSummary.netIncome)} color={COLORS.green} small />
+              {quickSummary.totalAssets > 0 && <Metric label="Assets" value={fmt(quickSummary.totalAssets)} color={COLORS.accent} small />}
+              {quickSummary.totalDebt > 0 && <Metric label="Debt" value={fmt(quickSummary.totalDebt)} color={COLORS.red} small />}
+            </div>
+          )}
+        </div>
+
+        {/* Main content */}
+        <div ref={mainRef} className="flex-1 overflow-y-auto p-6" style={{ maxWidth: 720 }}>
+          {stepContent()}
+
+          {/* Navigation */}
+          <div className="flex items-center justify-between mt-8 pt-4" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+            {state.step > 0 ? (
+              <button
+                onClick={() => goTo(state.step - 1)}
+                className="px-4 py-2 rounded-lg text-sm"
+                style={{ background: COLORS.border, color: COLORS.text }}
+              >
+                ← {STEPS[state.step - 1].label}
+              </button>
+            ) : <div />}
+            {state.step < STEPS.length - 1 ? (
+              <button
+                onClick={() => goTo(state.step + 1)}
+                className="px-4 py-2 rounded-lg text-sm font-medium"
+                style={{ background: COLORS.accent, color: COLORS.bg }}
+              >
+                {STEPS[state.step + 1].label} →
+              </button>
+            ) : <div />}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
